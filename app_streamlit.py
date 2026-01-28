@@ -71,6 +71,15 @@ if "uploaded_variations" not in st.session_state:
 # date for which computed_variations was generated (YYYY-MM-DD or None)
 if "computed_variations_date" not in st.session_state:
     st.session_state["computed_variations_date"] = None
+# data date mode (la moda de las fechas de los datos)
+if "data_date_mode" not in st.session_state:
+    st.session_state["data_date_mode"] = None
+# failed tickers
+if "failed_tickers" not in st.session_state:
+    st.session_state["failed_tickers"] = []
+# market status warning
+if "market_warning" not in st.session_state:
+    st.session_state["market_warning"] = None
 
 # Nota: el checkbox "Generar informe" solo indica usar el `systemprompt_template`.
 # No se descarga/ejecuta `compute_variations` hasta que el usuario envíe la consulta.
@@ -158,21 +167,52 @@ if user_input:
     # If user asked for system prompt / informe, compute CSV if no uploaded CSV
     # or if the already-computed CSV was generated for a different date.
     existing_computed_date = st.session_state.get("computed_variations_date")
+    existing_data_date_mode = st.session_state.get("data_date_mode")
+    
     if generate_report_checkbox and df_uploaded is None:
         need_compute = False
         if df_computed is None:
             need_compute = True
         else:
-            # compare dates (strings or None). If different, recompute.
+            # Comparar fechas: recalcular si la fecha solicitada cambió
             if existing_computed_date != compute_target_date:
                 need_compute = True
+            # TAMBIÉN recalcular si los datos existentes son de una fecha anterior a la solicitada
+            # (por si el mercado ya abrió desde la última vez que se calculó)
+            elif existing_data_date_mode and compute_target_date:
+                data_mode_date = datetime.datetime.strptime(existing_data_date_mode, "%Y-%m-%d").date()
+                requested_date = datetime.datetime.strptime(compute_target_date, "%Y-%m-%d").date()
+                if data_mode_date < requested_date:
+                    # Los datos son viejos, intentar recalcular por si el mercado ya abrió
+                    need_compute = True
+                    
         if need_compute:
             try:
-                df_out, close = compute_variations(TICKER_MAP, lookback="30d", target_date=compute_target_date)
+                df_out, close, data_date_mode, failed_tickers = compute_variations(TICKER_MAP, lookback="30d", target_date=compute_target_date)
                 st.session_state["computed_variations"] = df_out
                 # store the date used for this computation (can be None)
                 st.session_state["computed_variations_date"] = compute_target_date
+                st.session_state["data_date_mode"] = data_date_mode
+                st.session_state["failed_tickers"] = failed_tickers
                 df_computed = df_out
+                
+                # Verificar si hay tickers que fallaron
+                if failed_tickers:
+                    st.warning(f"⚠️ Los siguientes tickers fallaron en la descarga después de reintentos: {', '.join(failed_tickers)}")
+                
+                # Verificar si el mercado abrió comparando la fecha solicitada con la moda de fechas
+                if data_date_mode and compute_target_date:
+                    requested_date = datetime.datetime.strptime(compute_target_date, "%Y-%m-%d").date()
+                    data_mode_date = datetime.datetime.strptime(data_date_mode, "%Y-%m-%d").date()
+                    
+                    if requested_date > data_mode_date:
+                        # El mercado todavía no abrió para la fecha solicitada
+                        warning_msg = f"⚠️ **ATENCIÓN**: El mercado de EEUU todavía no abrió para el {requested_date.strftime('%d/%m/%Y')}. Los datos disponibles son del {data_mode_date.strftime('%d/%m/%Y')}. El informe se generará con los datos del día anterior."
+                        st.session_state["market_warning"] = warning_msg
+                        st.warning(warning_msg)
+                    else:
+                        st.session_state["market_warning"] = None
+                
                 st.info("CSV calculado y almacenado en sesión (computed_variations).")
             except Exception as e:
                 st.warning(f"No se pudo descargar el CSV: {e}")
@@ -272,27 +312,65 @@ if user_input:
         extracted_date = extract_date_from_text(user_input)
     except Exception:
         extracted_date = None
-    question_for_prompt = user_input
-    if not extracted_date:
-        # prefer date_picker if available, otherwise default to today
-        try:
-            if date_picker is not None:
-                qdate = date_picker.strftime("%d/%m/%Y")
-            else:
-                qdate = datetime.date.today().strftime("%d/%m/%Y")
-            if user_input and user_input.strip():
-                question_for_prompt = f"{user_input} para {qdate}"
-            else:
-                question_for_prompt = f"Generá resumen para {qdate}"
-        except Exception:
-            pass
+    
+    # Diccionario para días de la semana en español
+    DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    
+    # Verificar si el mercado no abrió y debemos usar la fecha de los datos reales
+    market_warning = st.session_state.get("market_warning")
+    data_date_mode = st.session_state.get("data_date_mode")
+    
+    # Determinar la fecha real a usar para el informe
+    # Si el mercado no abrió, usar la fecha de los datos (data_date_mode)
+    if market_warning and data_date_mode:
+        # Usar la fecha de los datos reales (día anterior)
+        report_date_obj = datetime.datetime.strptime(data_date_mode, "%Y-%m-%d").date()
+        dia_semana = DIAS_SEMANA[report_date_obj.weekday()]
+        qdate = f"{report_date_obj.strftime('%d/%m/%Y')} ({dia_semana})"
+        market_note = f"\n\n[NOTA: El mercado de EEUU todavía no abrió para la fecha solicitada. Los datos corresponden al {qdate}. Usá esta fecha para el informe.]"
+    else:
+        # Usar la fecha extraída, date_picker, o la fecha de los datos si está disponible
+        if extracted_date:
+            report_date_obj = datetime.datetime.strptime(extracted_date, "%Y-%m-%d").date()
+        elif date_picker is not None:
+            report_date_obj = date_picker
+        elif data_date_mode:
+            # Usar la fecha real de los datos del CSV
+            report_date_obj = datetime.datetime.strptime(data_date_mode, "%Y-%m-%d").date()
+        else:
+            report_date_obj = datetime.date.today()
+        dia_semana = DIAS_SEMANA[report_date_obj.weekday()]
+        qdate = f"{report_date_obj.strftime('%d/%m/%Y')} ({dia_semana})"
+        market_note = ""
+    
+    # Construir question_for_prompt con la fecha y día de la semana correctos
+    if user_input and user_input.strip():
+        question_for_prompt = f"{user_input} para {qdate}"
+    else:
+        question_for_prompt = f"Generá resumen para {qdate}"
+    
+    # Agregar nota de mercado si corresponde
+    if market_note:
+        question_for_prompt = question_for_prompt + market_note
+    
     if use_system_prompt:
         # build CSV textual block
         if df_use is None:
             st.warning("No hay CSV disponible: subí un CSV o presioná 'Calcular CSV' en la barra lateral.")
         csv_block = format_variations_for_prompt(df_use) if df_use is not None else ""
-        # final context: CSV + news/docs
-        merged_context = csv_block + "\n\n" + context
+        
+        # Filtrar el CSV del context para no duplicarlo (ya está en csv_block)
+        context_without_csv = "\n\n".join([
+            part for part in context_parts 
+            if "tickers_csv" not in part and "variacion_diaria.csv" not in part
+        ])
+        
+        # final context: CSV + news/docs (sin duplicar el CSV)
+        if context_without_csv.strip():
+            merged_context = csv_block + "\n\n" + context_without_csv
+        else:
+            merged_context = csv_block
+            
         try:
             with open(SYSTEM_PROMPT_PATH, "r", encoding="utf-8") as fh:
                 system_prompt_template = fh.read()
@@ -309,6 +387,19 @@ if user_input:
             rag_prompt_template = "{context}\n\n{question}"
         system_prompt = rag_prompt_template.format(context=context, question=question_for_prompt)
 
+    # Preparar los mensajes que se enviarán al modelo
+    llm_messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question_for_prompt}
+    ]
+
+    # DEBUG: Mostrar exactamente lo que recibe el modelo
+    with st.expander("🔍 DEBUG: Mensajes enviados al modelo", expanded=False):
+        st.markdown("**System:**")
+        st.code(llm_messages[0]["content"], language="text")
+        st.markdown("**User:**")
+        st.code(llm_messages[1]["content"], language="text")
+
     # call LLM (OpenAI) to generate answer
     with st.spinner("Generando respuesta con LLM..."):
         if OpenAI is None:
@@ -318,10 +409,7 @@ if user_input:
                 client = OpenAI()
                 resp = client.chat.completions.create(
                     model=openai_model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_input}
-                    ],
+                    messages=llm_messages,
                     temperature=temperature
                 )
                 answer = resp.choices[0].message.content
