@@ -14,7 +14,7 @@ Usá también la información que te copie de medios y las capturas con tickers 
 Formato obligatorio
 
 * La respuesta debe comenzar con fecha y día (por ejemplo: 17/12/2025 (miércoles)).
-* El dia de la semana debera tener correlación con la fecha.
+* Chequea el dia de la semana corresponda con la fecha en el prompt.
 * El cuerpo del texto debe ser un solo párrafo.
 * No repitas la fecha dentro del texto; referite al día solo como “lunes”, “martes”, etc.
 * El tono debe ser conciso, analítico y profesional, apto para un informe financiero.

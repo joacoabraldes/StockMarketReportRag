@@ -7,9 +7,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import streamlit as st
 import pandas as pd
 
-# chroma/langchain imports if you use them
-import chromadb
-from langchain_chroma import Chroma
+# langchain HuggingFace embeddings (no Chroma/ingest usage)
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # openai optional
@@ -35,12 +33,6 @@ THRESHOLD_PATH = "./threshold_dataset.jsonl"
 
 # --------- Sidebar ----------
 st.sidebar.header("⚙️ Configuración")
-persist_dir  = st.sidebar.text_input("Ruta de Chroma (persist)", value=DEFAULT_PERSIST)
-client = chromadb.PersistentClient(path=persist_dir)
-collections = [c.name for c in client.list_collections()]
-if not collections:
-    st.sidebar.warning("No hay colecciones. Ingestá documentos con ingest.py")
-selected_cols = st.sidebar.multiselect("Colecciones a consultar", options=collections, default=collections[:1] if collections else [])
 
 # news inputs
 news_text = st.sidebar.text_area("Texto de noticias (opcional)", value="", height=150)
@@ -69,29 +61,21 @@ def get_embedder_cached(model_name: str):
 
 embedder = get_embedder_cached(embed_model)
 
-# vectordb per selected col
-def get_vectordbs(persist_path, selected_cols, embedder):
-    out = {}
-    for col in selected_cols:
-        out[col] = Chroma(client=chromadb.PersistentClient(path=persist_path), collection_name=col, embedding_function=embedder)
-    return out
-
-vectordbs = get_vectordbs(persist_dir, selected_cols, embedder)
+# no vectordb usage: retrieval will use only `news_text`, `news_urls` and uploaded/computed CSV
 
 # session_state for variations
 if "computed_variations" not in st.session_state:
     st.session_state["computed_variations"] = None
 if "uploaded_variations" not in st.session_state:
     st.session_state["uploaded_variations"] = None
+# date for which computed_variations was generated (YYYY-MM-DD or None)
+if "computed_variations_date" not in st.session_state:
+    st.session_state["computed_variations_date"] = None
 
-# compute CSV via button
+# Nota: el checkbox "Generar informe" solo indica usar el `systemprompt_template`.
+# No se descarga/ejecuta `compute_variations` hasta que el usuario envíe la consulta.
 if generate_report_checkbox:
-    try:
-        df_out, close = compute_variations(TICKER_MAP, lookback="30d", target_date=date_picker)
-        st.session_state["computed_variations"] = df_out
-        st.success("CSV generado y almacenado en sesión (computed_variations).")
-    except Exception as e:
-        st.error(f"Error calculando CSV: {e}")
+    st.sidebar.info("Al enviar la consulta se usará el sistema de 'informe' (system prompt). El CSV se descargará solo si es necesario.")
 
 # option to upload csv
 uploaded = st.sidebar.file_uploader("Subir CSV de variaciones (opcional)", type=["csv"])
@@ -126,35 +110,74 @@ if user_input:
     candidates_all = []
     local_docs = []
 
-    # fetch content from selected chroma collections
-    for col, vdb in vectordbs.items():
-        try:
-            for qexp in [user_input]:
-                for doc, dist in vdb.similarity_search_with_score(qexp, k=max(5, k_total)):
-                    md = dict(doc.metadata or {})
-                    md["_collection"] = col
-                    doc.metadata = md
-                    candidates_all.append((doc, dist))
-        except Exception:
-            continue
-
-    # add news_text chunks
+    # add news_text as individual news items (do NOT chunk)
     if news_text and news_text.strip():
-        for i, ch in enumerate(chunk_text(news_text, max_chars=1200), 1):
-            local_docs.append(SimpleDoc(page_content=ch, metadata={"_collection":"news_user","source":"news_text","chunk_id":i}))
+        # split on blank lines to separate distinct news items; fallback to whole text
+        parts = [p.strip() for p in news_text.split("\n\n") if p.strip()]
+        if not parts:
+            parts = [news_text.strip()]
+        for i, part in enumerate(parts, 1):
+            local_docs.append(SimpleDoc(page_content=part, metadata={"_collection":"news_user","source":"news_text","news_id":i}))
 
-    # add news_urls texts
+    # add each URL as a single SimpleDoc (do NOT chunk)
     if news_urls and news_urls.strip():
-        for i, url in enumerate([u.strip() for u in news_urls.splitlines() if u.strip()],1):
+        for i, url in enumerate([u.strip() for u in news_urls.splitlines() if u.strip()], 1):
             txt = fetch_url_text(url)
-            if not txt: continue
-            for j, ch in enumerate(chunk_text(txt, max_chars=1200),1):
-                local_docs.append(SimpleDoc(page_content=ch, metadata={"_collection":"news_url","source":url,"chunk_id":f"{i}.{j}"}))
+            if not txt:
+                continue
+            local_docs.append(SimpleDoc(page_content=txt, metadata={"_collection":"news_url","source":url,"news_id":i}))
 
     # add CSV rows (uploaded preferred, else computed)
     from utils import df_to_single_doc  # importa si no lo tenés ya
 
-    df_use = st.session_state.get("uploaded_variations") or st.session_state.get("computed_variations")
+    # If the user selected 'Generar informe' (use system prompt) we compute the CSV
+    # only when the user submits the prompt and only if there's no uploaded CSV.
+    df_uploaded = st.session_state.get("uploaded_variations")
+    df_computed = st.session_state.get("computed_variations")
+    # determine date to request for compute: prefer date in user_input, otherwise date_picker
+    extracted_date = None
+    try:
+        extracted_date = extract_date_from_text(user_input)
+    except Exception:
+        extracted_date = None
+    compute_target_date = None
+    if extracted_date:
+        compute_target_date = extracted_date
+    elif date_picker is not None:
+        try:
+            compute_target_date = date_picker.strftime("%Y-%m-%d")
+        except Exception:
+            compute_target_date = None
+    else:
+        # default to today's date if none provided
+        try:
+            compute_target_date = datetime.date.today().strftime("%Y-%m-%d")
+        except Exception:
+            compute_target_date = None
+
+    # If user asked for system prompt / informe, compute CSV if no uploaded CSV
+    # or if the already-computed CSV was generated for a different date.
+    existing_computed_date = st.session_state.get("computed_variations_date")
+    if generate_report_checkbox and df_uploaded is None:
+        need_compute = False
+        if df_computed is None:
+            need_compute = True
+        else:
+            # compare dates (strings or None). If different, recompute.
+            if existing_computed_date != compute_target_date:
+                need_compute = True
+        if need_compute:
+            try:
+                df_out, close = compute_variations(TICKER_MAP, lookback="30d", target_date=compute_target_date)
+                st.session_state["computed_variations"] = df_out
+                # store the date used for this computation (can be None)
+                st.session_state["computed_variations_date"] = compute_target_date
+                df_computed = df_out
+                st.info("CSV calculado y almacenado en sesión (computed_variations).")
+            except Exception as e:
+                st.warning(f"No se pudo descargar el CSV: {e}")
+
+    df_use = df_uploaded or df_computed
     if df_use is not None:
         # crea un único SimpleDoc que contiene TODO el CSV
         single_doc = df_to_single_doc(
@@ -164,29 +187,49 @@ if user_input:
         )
         local_docs.append(single_doc)
 
-    # try to embed local_docs and add to candidates_all (so they compete with chroma)
+    # try to embed local_docs and add to candidates_all (so they are considered for retrieval)
     try:
         embedder_local = embedder
-        # embed query if function present
-        if hasattr(embedder_local, "embed_query"):
-            query_emb = embedder_local.embed_query(user_input)
-            texts = [d.page_content for d in local_docs]
-            if texts:
+        texts = [d.page_content for d in local_docs]
+        if texts:
+            # compute query embedding (prefer embed_query, fallback to embed_documents)
+            query_emb = None
+            try:
+                if hasattr(embedder_local, "embed_query"):
+                    query_emb = embedder_local.embed_query(user_input)
+                else:
+                    q_embs = embedder_local.embed_documents([user_input])
+                    query_emb = q_embs[0] if q_embs else None
+            except Exception:
+                query_emb = None
+
+            # compute embeddings for local docs
+            try:
                 emb_list = embedder_local.embed_documents(texts)
-                import numpy as _np
-                def cos(a,b):
-                    a=_np.array(a); b=_np.array(b)
-                    if a.size==0 or b.size==0: return 0.0
-                    na=_np.linalg.norm(a); nb=_np.linalg.norm(b)
-                    if na==0 or nb==0: return 0.0
-                    return float(_np.dot(a,b)/(na*nb))
+            except Exception:
+                emb_list = []
+
+            import numpy as _np
+            def cos(a,b):
+                a=_np.array(a); b=_np.array(b)
+                if a.size==0 or b.size==0: return 0.0
+                na=_np.linalg.norm(a); nb=_np.linalg.norm(b)
+                if na==0 or nb==0: return 0.0
+                return float(_np.dot(a,b)/(na*nb))
+
+            if emb_list and query_emb is not None:
                 for d, emb in zip(local_docs, emb_list):
                     sim = cos(query_emb, emb)
                     dist = 1.0 - sim
                     candidates_all.append((d, dist))
+            else:
+                # fallback: include local_docs with neutral distance so they appear in context
+                for d in local_docs:
+                    candidates_all.append((d, 1.0))
     except Exception:
-        # ignore embed errors
-        pass
+        # ignore embed errors but ensure local_docs are still considered
+        for d in local_docs:
+            candidates_all.append((d, 1.0))
 
     # Build top docs (simple scoring: use dist as score proxy, no recency for brevity)
     scored = []
@@ -223,6 +266,26 @@ if user_input:
 
     # If generate_report_checkbox is True -> use systemprompt_template and include the CSV (if exists)
     use_system_prompt = generate_report_checkbox and os.path.exists(SYSTEM_PROMPT_PATH)
+    # Ensure the date for the summary is present in the question passed to the system prompt.
+    # Prefer an explicit date in the user_input (extracted), otherwise use the date_picker if provided.
+    try:
+        extracted_date = extract_date_from_text(user_input)
+    except Exception:
+        extracted_date = None
+    question_for_prompt = user_input
+    if not extracted_date:
+        # prefer date_picker if available, otherwise default to today
+        try:
+            if date_picker is not None:
+                qdate = date_picker.strftime("%d/%m/%Y")
+            else:
+                qdate = datetime.date.today().strftime("%d/%m/%Y")
+            if user_input and user_input.strip():
+                question_for_prompt = f"{user_input} para {qdate}"
+            else:
+                question_for_prompt = f"Generá resumen para {qdate}"
+        except Exception:
+            pass
     if use_system_prompt:
         # build CSV textual block
         if df_use is None:
@@ -236,7 +299,7 @@ if user_input:
         except Exception:
             st.error("No se pudo cargar system prompt.")
             system_prompt_template = "{context}\n\n{question}"
-        system_prompt = system_prompt_template.format(context=merged_context, question=user_input)
+        system_prompt = system_prompt_template.format(context=merged_context, question=question_for_prompt)
     else:
         # normal RAG prompt
         try:
@@ -244,7 +307,7 @@ if user_input:
                 rag_prompt_template = fh.read()
         except Exception:
             rag_prompt_template = "{context}\n\n{question}"
-        system_prompt = rag_prompt_template.format(context=context, question=user_input)
+        system_prompt = rag_prompt_template.format(context=context, question=question_for_prompt)
 
     # call LLM (OpenAI) to generate answer
     with st.spinner("Generando respuesta con LLM..."):
