@@ -6,33 +6,6 @@ import numpy as np
 import yfinance as yf
 from collections import Counter
 
-TICKER_MAP = {
-    "SPX": "^GSPC",
-    "NDX": "^NDX",
-    "VIX": "^VIX",
-    "ILF": "ILF",
-    "EWZ": "EWZ",
-    "EMB": "EMB",
-    "/CL": "CL=F",
-    "GLD": "GLD",
-    "XLE": "XLE",
-    "XLC": "XLC",
-    "XLP": "XLP",
-    "XLK": "XLK",
-    "XLV": "XLV",
-    "QTUM": "QTUM",
-    "SOXX": "SOXX",
-    "TSLA": "TSLA",
-    "AAPL": "AAPL",
-    "GOOG": "GOOG",
-    "NVDA": "NVDA",
-    "META": "META",
-    "MSFT": "MSFT",
-    "AMZN": "AMZN",
-    "RGTI": "RGTI",
-    "QBTS": "QBTS",
-    "IONQ": "IONQ",
-}
 
 def _normalize_close_dataframe(px: pd.DataFrame, symbols: list) -> pd.DataFrame:
     if px.empty:
@@ -148,51 +121,6 @@ def _download_with_fallback(symbols_map: Dict[str, str], lookback: str = "30d") 
     
     return close, failed_symbols
 
-def _fetch_intraday_latest(symbol: str, retry_delays: Optional[list] = None) -> Optional[Tuple[float, pd.Timestamp]]:
-    if retry_delays is None:
-        retry_delays = [0, 0.2, 0.5]
-    intervals_to_try = ["1m", "5m", "15m"]
-    for i, interval in enumerate(intervals_to_try):
-        delay = retry_delays[i] if i < len(retry_delays) else 0
-        try:
-            if delay:
-                time.sleep(delay)
-            intr = yf.download(
-                tickers=symbol,
-                period="1d",
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-                group_by="ticker",
-            )
-            if intr is None or intr.empty:
-                continue
-            if isinstance(intr.columns, pd.MultiIndex):
-                if "Close" in intr:
-                    close_series = intr["Close"].copy()
-                    if isinstance(close_series, pd.DataFrame):
-                        if symbol in close_series.columns:
-                            s = close_series[symbol].dropna()
-                        else:
-                            s = close_series.iloc[:, 0].dropna()
-                    else:
-                        s = close_series.dropna()
-                else:
-                    s = intr.iloc[:, 0].dropna()
-            else:
-                if "Close" in intr.columns:
-                    s = intr["Close"].dropna()
-                else:
-                    s = intr.iloc[:, 0].dropna()
-            if len(s) == 0:
-                continue
-            last_ts = pd.to_datetime(s.index[-1])
-            last_price = float(s.iloc[-1])
-            return last_price, last_ts
-        except Exception:
-            continue
-    return None
-
 def compute_variations(symbols_map: Dict[str, str], lookback: str = "30d", target_date: str = None) -> Tuple[pd.DataFrame, pd.DataFrame, Optional[str], List[str]]:
     """
     Calcula variaciones diarias de los tickers.
@@ -272,18 +200,73 @@ def compute_variations(symbols_map: Dict[str, str], lookback: str = "30d", targe
         date_counts = Counter(all_dates)
         data_date_mode = date_counts.most_common(1)[0][0].strftime("%Y-%m-%d")
     
+    # ── Recalcular si hay mezcla de fechas ──────────────────────────
+    # Cuando el mercado no abrió para target_date, algunos tickers traen
+    # datos del día pedido (ej: futuros) y otros del día anterior.  La moda
+    # indica cuál es el día "real".  Si hay tickers con fecha != moda,
+    # recortamos close hasta la moda y recalculamos para que TODOS los
+    # valores correspondan al mismo día.
+    if data_date_mode and target_date is not None:
+        mode_dt = pd.to_datetime(data_date_mode).normalize()
+        target_dt = pd.to_datetime(target_date).normalize()
+        # Verificar si hay tickers con fecha distinta a la moda
+        mixed_dates = any(
+            r[5] is not None and pd.to_datetime(r[5]).normalize() != mode_dt
+            for r in rows if r[6] == "OK"
+        )
+        if mixed_dates or target_dt > mode_dt:
+            # Recortar close al día de la moda y recalcular
+            close_trimmed = close[close.index.normalize() <= mode_dt].copy()
+            if not close_trimmed.empty:
+                rows = []
+                all_dates = []
+                for label, sym in symbols_map.items():
+                    if sym not in close_trimmed.columns:
+                        rows.append([label, sym, np.nan, np.nan, np.nan, None, "ERROR_DESCARGA"])
+                        continue
+                    s = close_trimmed[sym].dropna()
+                    if len(s) < 2:
+                        last_val = float(s.iloc[-1]) if len(s) else np.nan
+                        last_date = s.index[-1].date() if len(s) else None
+                        rows.append([label, sym, last_val, np.nan, np.nan, last_date, "PARCIAL"])
+                        if last_date:
+                            all_dates.append(last_date)
+                        continue
+                    last_date = s.index[-1]
+                    last_px = float(s.iloc[-1])
+                    prev_px = float(s.iloc[-2])
+                    chg = (last_px / prev_px - 1.0) * 100.0
+                    all_dates.append(last_date.date())
+                    rows.append([label, sym, last_px, prev_px, chg, last_date.date(), "OK"])
+                out = pd.DataFrame(
+                    rows,
+                    columns=["Ticker", "YahooSymbol", "Close_last", "Close_prev",
+                             "Var_diaria_%", "Fecha_last", "Status"],
+                )
+                if "Var_diaria_%" in out.columns:
+                    try:
+                        out["Var_diaria_%"] = out["Var_diaria_%"].astype(float).round(2)
+                    except Exception:
+                        pass
+                # Recalcular moda (debería ser uniforme ahora)
+                if all_dates:
+                    date_counts = Counter(all_dates)
+                    data_date_mode = date_counts.most_common(1)[0][0].strftime("%Y-%m-%d")
+                close = close_trimmed
+
     # Crear lista de tickers que fallaron (para el label, no el símbolo)
     failed_tickers = [label for label, sym in symbols_map.items() if sym in failed_symbols]
     
     return out, close, data_date_mode, failed_tickers
 
 if __name__ == "__main__":
+    from config.market_config import US_TICKER_MAP
     p = argparse.ArgumentParser()
     p.add_argument("--lookback", default="30d", help="yfinance period (e.g. 30d, 3mo)")
     p.add_argument("--out", default="variacion_diaria.csv", help="output csv path")
     p.add_argument("--date", default=None, help="optional target date YYYY-MM-DD")
     args = p.parse_args()
-    out_df, close_df, data_date_mode, failed_tickers = compute_variations(TICKER_MAP, args.lookback, args.date)
+    out_df, close_df, data_date_mode, failed_tickers = compute_variations(US_TICKER_MAP, args.lookback, args.date)
     out_df.to_csv(args.out, index=False)
     close_df.to_csv("precios_close.csv")
     print("CSV guardado en", args.out)

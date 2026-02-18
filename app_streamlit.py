@@ -7,7 +7,7 @@ from typing import List, Tuple, Dict, Any, Optional
 import streamlit as st
 import pandas as pd
 
-# langchain HuggingFace embeddings (no Chroma/ingest usage)
+# langchain HuggingFace embeddings
 from langchain_huggingface import HuggingFaceEmbeddings
 
 # openai optional
@@ -16,23 +16,42 @@ try:
 except Exception:
     OpenAI = None
 
-from utils import clean_text, clean_keep_ascii_marks, fetch_url_text, chunk_text, SimpleDoc, extract_date_from_text, format_variations_for_prompt
-from evaluator import load_dataset, build_eval_prompt, call_evaluator
-from compute_variations import TICKER_MAP, compute_variations
+from core.utils import clean_text, fetch_url_text, SimpleDoc, extract_date_from_text, format_variations_for_prompt, df_to_single_doc
+from core.evaluator import load_dataset, build_eval_prompt, call_evaluator, extract_date_from_prompt, find_reference_for_date
+from core.compute_variations import compute_variations
+from config.market_config import get_market_config
+from core.debug_logger import DebugSession
 
 # --------- Config / defaults ----------
 st.set_page_config(page_title="PARROT RAG", layout="wide")
 st.title("🦜 PARROT RAG — informe de rueda (CSV -> resumen)")
 
-DEFAULT_PERSIST   = os.environ.get("CHROMA_DB_DIR", "./chroma_db")
 DEFAULT_EMBED     = os.environ.get("EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 DEFAULT_OAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
-SYSTEM_PROMPT_PATH = os.environ.get("SYSTEM_PROMPT_TEMPLATE", "./systemprompt_template.txt")
-RAG_PROMPT_PATH = os.environ.get("PROMPT_TEMPLATE", "./prompt_template.txt")
-THRESHOLD_PATH = "./threshold_dataset.jsonl"
 
 # --------- Sidebar ----------
 st.sidebar.header("⚙️ Configuración")
+
+# Opciones para informe
+st.sidebar.markdown("### Opciones para informe")
+generate_report_checkbox = st.sidebar.checkbox("Generar informe de la rueda", value=False)
+
+# Market toggle (US ↔ AR) — right below the report checkbox
+is_argentina = st.sidebar.toggle("🇦🇷 Mercado Argentina", value=False, help="Desactivado = 🇺🇸 EEUU · Activado = 🇦🇷 Argentina")
+selected_market = "AR" if is_argentina else "US"
+market_config = get_market_config(selected_market)
+
+# Derive paths from market config
+SYSTEM_PROMPT_PATH = market_config.system_prompt_path
+RAG_PROMPT_PATH = market_config.rag_prompt_path
+THRESHOLD_PATH = market_config.threshold_dataset_path
+TICKER_MAP = market_config.ticker_map
+
+date_picker = st.sidebar.date_input("Fecha del informe (default:hoy)", value=None)
+
+# Debug toggle
+enable_debug = st.sidebar.checkbox("🐛 Mostrar debug (conversación agentes)", value=False)
+st.sidebar.markdown("---")
 
 # news inputs
 news_text = st.sidebar.text_area("Texto de noticias (opcional)", value="", height=150)
@@ -42,15 +61,11 @@ k_total = st.sidebar.slider("Top-k total", 1, 30, 10, 1)
 temperature = st.sidebar.slider("Temperature (OpenAI)", 0.0, 1.0, 0.0, 0.1)
 openai_model = st.sidebar.text_input("Modelo OpenAI", value=DEFAULT_OAI_MODEL)
 embed_model = st.sidebar.text_input("Modelo de Embeddings (HF)", value=DEFAULT_EMBED)
-history_path = st.sidebar.text_input("Archivo de historial (JSONL)", value="./history/chat_history.jsonl")
+history_path = st.sidebar.text_input("Archivo de historial (JSONL)", value="./data/history/chat_history.jsonl")
 show_sources = st.sidebar.checkbox("Mostrar fuentes", value=True)
 show_scores = st.sidebar.checkbox("Mostrar score", value=False)
 show_preview = st.sidebar.checkbox("Mostrar preview", value=True)
 
-st.sidebar.markdown("---")
-st.sidebar.markdown("Opciones para informe")
-generate_report_checkbox = st.sidebar.checkbox("Generar informe de la rueda", value=False)
-date_picker = st.sidebar.date_input("Fecha del informe (default:hoy)", value=None)
 st.sidebar.markdown("---")
 st.sidebar.caption("Requiere OPENAI_API_KEY si querés usar verificador OpenAI.")
 
@@ -61,13 +76,11 @@ def get_embedder_cached(model_name: str):
 
 embedder = get_embedder_cached(embed_model)
 
-# no vectordb usage: retrieval will use only `news_text`, `news_urls` and uploaded/computed CSV
+# no vectordb usage: retrieval will use only `news_text`, `news_urls` and computed CSV
 
 # session_state for variations
 if "computed_variations" not in st.session_state:
     st.session_state["computed_variations"] = None
-if "uploaded_variations" not in st.session_state:
-    st.session_state["uploaded_variations"] = None
 # date for which computed_variations was generated (YYYY-MM-DD or None)
 if "computed_variations_date" not in st.session_state:
     st.session_state["computed_variations_date"] = None
@@ -85,16 +98,6 @@ if "market_warning" not in st.session_state:
 # No se descarga/ejecuta `compute_variations` hasta que el usuario envíe la consulta.
 if generate_report_checkbox:
     st.sidebar.info("Al enviar la consulta se usará el sistema de 'informe' (system prompt). El CSV se descargará solo si es necesario.")
-
-# option to upload csv
-uploaded = st.sidebar.file_uploader("Subir CSV de variaciones (opcional)", type=["csv"])
-if uploaded:
-    try:
-        df_uploaded = pd.read_csv(uploaded)
-        st.session_state["uploaded_variations"] = df_uploaded
-        st.sidebar.success("CSV subido y guardado en sesión.")
-    except Exception as e:
-        st.sidebar.error(f"Error al leer CSV: {e}")
 
 # ----- Chat render previo (history) -----
 if "messages" not in st.session_state:
@@ -136,12 +139,8 @@ if user_input:
                 continue
             local_docs.append(SimpleDoc(page_content=txt, metadata={"_collection":"news_url","source":url,"news_id":i}))
 
-    # add CSV rows (uploaded preferred, else computed)
-    from utils import df_to_single_doc  # importa si no lo tenés ya
-
+    # add CSV rows (computed)
     # If the user selected 'Generar informe' (use system prompt) we compute the CSV
-    # only when the user submits the prompt and only if there's no uploaded CSV.
-    df_uploaded = st.session_state.get("uploaded_variations")
     df_computed = st.session_state.get("computed_variations")
     # determine date to request for compute: prefer date in user_input, otherwise date_picker
     extracted_date = None
@@ -164,12 +163,12 @@ if user_input:
         except Exception:
             compute_target_date = None
 
-    # If user asked for system prompt / informe, compute CSV if no uploaded CSV
+    # If user asked for system prompt / informe, compute CSV
     # or if the already-computed CSV was generated for a different date.
     existing_computed_date = st.session_state.get("computed_variations_date")
     existing_data_date_mode = st.session_state.get("data_date_mode")
     
-    if generate_report_checkbox and df_uploaded is None:
+    if generate_report_checkbox:
         need_compute = False
         if df_computed is None:
             need_compute = True
@@ -217,7 +216,7 @@ if user_input:
             except Exception as e:
                 st.warning(f"No se pudo descargar el CSV: {e}")
 
-    df_use = df_uploaded or df_computed
+    df_use = df_computed
     if df_use is not None:
         # crea un único SimpleDoc que contiene TODO el CSV
         single_doc = df_to_single_doc(
@@ -285,24 +284,6 @@ if user_input:
         context_parts.append(f"[{i}] ({doc.metadata.get('_collection')})\n{doc.page_content}")
     context = "\n\n".join(context_parts)
 
-
-    tools = [
-    {
-        "type": "function",
-        "name": "get_horoscope",
-        "description": "Get today's horoscope for an astrological sign.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "sign": {
-                    "type": "string",
-                    "description": "An astrological sign like Taurus or Aquarius",
-                },
-            },
-            "required": ["sign"],
-        },
-    },
-    ]
 
     # If generate_report_checkbox is True -> use systemprompt_template and include the CSV (if exists)
     use_system_prompt = generate_report_checkbox and os.path.exists(SYSTEM_PROMPT_PATH)
@@ -393,28 +374,174 @@ if user_input:
         {"role": "user", "content": question_for_prompt}
     ]
 
-    # DEBUG: Mostrar exactamente lo que recibe el modelo
-    with st.expander("🔍 DEBUG: Mensajes enviados al modelo", expanded=False):
-        st.markdown("**System:**")
-        st.code(llm_messages[0]["content"], language="text")
-        st.markdown("**User:**")
-        st.code(llm_messages[1]["content"], language="text")
+    # Preparar evaluación si es informe
+    ds = None
+    few_shot = None
+    reference_response = None
+    query_date = None
+    if use_system_prompt and df_use is not None:
+        ds = load_dataset(THRESHOLD_PATH)
+        few_shot = ds[:3]
+        prompt_text = format_variations_for_prompt(df_use)
+        query_date = extract_date_from_prompt(prompt_text)
+        if query_date:
+            ref_entry = find_reference_for_date(ds, query_date)
+            if ref_entry:
+                reference_response = ref_entry.get("response")
 
-    # call LLM (OpenAI) to generate answer
+    # call LLM (OpenAI) to generate answer - with retry if score < threshold
+    MAX_RETRIES = market_config.max_eval_retries
+    MIN_SCORE = market_config.min_eval_score
+    best_answer = None
+    best_score = 0.0
+    best_eval_res = None
+    attempts = []
+
+    # Initialise debug session
+    debug_session = DebugSession()
+    debug_session.start(market_id=market_config.market_id, target_date=compute_target_date or "")
+    
     with st.spinner("Generando respuesta con LLM..."):
         if OpenAI is None:
             answer = "⚠️ OpenAI SDK no disponible en el entorno. Configura OPENAI_API_KEY o instala openai."
         else:
-            try:
-                client = OpenAI()
-                resp = client.chat.completions.create(
-                    model=openai_model,
-                    messages=llm_messages,
-                    temperature=temperature
-                )
-                answer = resp.choices[0].message.content
-            except Exception as e:
-                answer = f"⚠️ Error llamando a OpenAI: {e}"
+            client = OpenAI()
+            # Datos CSV formateados para re-anclar en cada reintento
+            csv_data_for_eval = ""
+            if use_system_prompt and df_use is not None:
+                csv_data_for_eval = format_variations_for_prompt(df_use)
+                if news_text:
+                    csv_data_for_eval += f"\n\nNoticias:\n{news_text}"
+
+            accumulated_feedback: list[dict] = []  # Historial de correcciones estructuradas
+            eval_history: list[dict] = []  # Historial completo para el evaluador
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    # Temperatura: subir muy poco (+0.03/intento, max +0.12)
+                    retry_temp = min(temperature + (attempt * 0.03), temperature + 0.12)
+
+                    if attempt == 0:
+                        # Primera iteración: prompt original
+                        send_messages = llm_messages.copy()
+                    else:
+                        # Construir bloque de feedback holístico del evaluador
+                        feedback_parts = []
+                        for i, fb in enumerate(accumulated_feedback):
+                            part = f"--- Intento {i+1} (score {fb['score']:.2f}) ---"
+                            if fb.get('reason'):
+                                part += f"\nAnálisis del evaluador: {fb['reason']}"
+                            if fb.get('datos_correctos') is False:
+                                part += "\n⚠️ HAY VALORES NUMÉRICOS INCORRECTOS. Verificá cada dato contra el CSV."
+                            if fb.get('narrativa_quality'):
+                                part += f"\nCalidad narrativa: {fb['narrativa_quality']}"
+                            if fb.get('mejoras'):
+                                part += "\nMEJORAS PRIORITARIAS:"
+                                for mejora in fb['mejoras']:
+                                    part += f"\n  • {mejora}"
+                            feedback_parts.append(part)
+
+                        feedback_block = "\n\n".join(feedback_parts)
+
+                        retry_user_msg = f"""{question_for_prompt}
+
+ATENCIÓN: Este es el intento {attempt + 1}. El evaluador encontró aspectos a mejorar.
+
+=== DATOS CSV DE REFERENCIA (verificá tus valores contra estos) ===
+{csv_data_for_eval}
+
+=== FEEDBACK DEL EVALUADOR (intentos anteriores) ===
+{feedback_block}
+
+=== INSTRUCCIONES ===
+1. Leé el feedback del evaluador y aplicá las mejoras prioritarias.
+2. Verificá que los valores numéricos que mencionés coincidan con el CSV.
+3. Priorizá la narrativa: explicá POR QUÉ se movió el mercado, no solo listés tickers.
+4. Integrá noticias y datos macro como causas de los movimientos.
+5. Mantené estructura profesional (párrafos fluidos, no bullet points).
+
+Generá la respuesta mejorada ahora:"""
+                        send_messages = [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": retry_user_msg},
+                        ]
+
+                    resp = client.chat.completions.create(
+                        model=openai_model,
+                        messages=send_messages,
+                        temperature=min(retry_temp, 1.0)
+                    )
+                    answer = resp.choices[0].message.content
+                    
+                    # Evaluar solo si es informe
+                    if use_system_prompt and df_use is not None and few_shot:
+                        eval_prompt = build_eval_prompt(
+                            few_shot, csv_data_for_eval, answer, reference_response,
+                            iteration=attempt + 1,
+                            previous_attempts=eval_history if eval_history else None,
+                        )
+                        eval_res, eval_raw = call_evaluator(eval_prompt, openai_model=openai_model, temperature=0.0)
+                        score = eval_res.get("score", 0.0)
+                        reason = eval_res.get("reason", "")
+                        attempts.append({"attempt": attempt + 1, "score": score, "reason": reason})
+
+                        # Record in debug session
+                        writer_user_msg = send_messages[-1]["content"]
+                        debug_session.add_iteration(
+                            iteration=attempt + 1,
+                            writer_system=system_prompt,
+                            writer_user=writer_user_msg,
+                            writer_response=answer,
+                            writer_temperature=retry_temp,
+                            evaluator_prompt=eval_prompt,
+                            evaluator_raw=eval_raw,
+                            eval_score=score,
+                            eval_ok=score >= MIN_SCORE,
+                            eval_reason=reason,
+                        )
+                        
+                        # Guardar mejor respuesta
+                        if score > best_score:
+                            best_score = score
+                            best_answer = answer
+                            best_eval_res = eval_res
+                        
+                        # Si alcanzamos el umbral, salir
+                        if score >= MIN_SCORE:
+                            break
+                        
+                        # Acumular feedback holístico para el próximo intento
+                        if attempt < MAX_RETRIES - 1:
+                            accumulated_feedback.append({
+                                "score": score,
+                                "reason": reason,
+                                "datos_correctos": eval_res.get("datos_correctos", True),
+                                "narrativa_quality": eval_res.get("narrativa_quality", ""),
+                                "mejoras": eval_res.get("mejoras", []),
+                            })
+                            eval_history.append({
+                                "iteration": attempt + 1,
+                                "response": answer,
+                                "score": score,
+                                "reason": reason,
+                                "mejoras": eval_res.get("mejoras", []),
+                            })
+                    else:
+                        # No es informe, no evaluar
+                        best_answer = answer
+                        break
+                        
+                except Exception as e:
+                    answer = f"⚠️ Error llamando a OpenAI: {e}"
+                    best_answer = answer
+                    break
+            
+            # Usar la mejor respuesta encontrada
+            if best_answer:
+                answer = best_answer
+
+    # Finish debug session
+    debug_session.finish(final_answer=answer, final_score=best_score)
 
     # show sources
     sources = []
@@ -433,29 +560,177 @@ if user_input:
 
     st.session_state.messages.append({"role":"assistant","content":answer,"sources":sources})
 
-    # If we generated an "informe", run evaluator and show score
+    # If we generated an "informe", show evaluation results (already computed during generation)
     if use_system_prompt and df_use is not None:
-        ds = load_dataset(THRESHOLD_PATH)
-        few_shot = ds[:3]
-        eval_prompt = build_eval_prompt(few_shot, user_input, answer)
-        eval_res = call_evaluator(eval_prompt, openai_model=openai_model, temperature=0.0)
-        # normalize
-        score = eval_res.get("score", 0.0)
-        ok = bool(eval_res.get("ok", False))
-        reason = eval_res.get("reason", "")
+        # Guardar en session_state para que persista al hacer click en botones
+        st.session_state["last_eval_result"] = {
+            "score": best_score,
+            "eval_res": best_eval_res,
+            "answer": answer,
+            "df_use": df_use,
+            "news_text": news_text,
+            "attempts": attempts,
+            "query_date": query_date,
+            "reference_response": reference_response
+        }
+        # Store debug session in session_state so it survives reruns
+        st.session_state["last_debug_session"] = debug_session
+        
+        if query_date and reference_response:
+            st.sidebar.info(f"📊 Usando referencia del dataset para {query_date}")
+        
+        # Mostrar intentos de generación
+        if attempts:
+            st.sidebar.markdown("### 🔄 Intentos de generación")
+            for att in attempts:
+                emoji = "✅" if att["score"] >= MIN_SCORE else "⚠️"
+                st.sidebar.write(f"{emoji} Intento {att['attempt']}: Score **{att['score']:.2f}**")
+            st.sidebar.write(f"Total de intentos: **{len(attempts)}**")
+        
+        # Usar los resultados de evaluación ya calculados
+        if best_eval_res:
+            score = best_eval_res.get("score", 0.0)
+            ok = score >= MIN_SCORE
+            reason = best_eval_res.get("reason", "")
+        else:
+            score = 0.0
+            ok = False
+            reason = "No se pudo evaluar"
+        
         st.sidebar.markdown("### Evaluación del informe")
-        st.sidebar.write(f"Score: **{score:.2f}** — OK: **{ok}**")
+        if score >= MIN_SCORE:
+            st.sidebar.success(f"✅ Score: **{score:.2f}** — Aprobado")
+        else:
+            st.sidebar.warning(f"⚠️ Score: **{score:.2f}** — Mejor resultado después de {len(attempts)} intentos")
         st.sidebar.write(f"Motivo: {reason}")
 
-        # option to append generated example to dataset
-        if st.sidebar.button("Agregar ejemplo generado al dataset (threshold_dataset.jsonl)"):
+# ─── Debug visual: timeline de agentes ───────────────────────────
+if enable_debug and "last_debug_session" in st.session_state and st.session_state["last_debug_session"]:
+    dsess: DebugSession = st.session_state["last_debug_session"]
+
+    st.markdown("---")
+    # Header con resumen visual
+    score_color = "🟢" if dsess.final_score >= market_config.min_eval_score else "🔴"
+    st.markdown(
+        f"## 🐛 Debug — Conversación entre agentes\n"
+        f"**Iteraciones:** {dsess.total_iterations}  ·  "
+        f"**Score final:** {score_color} {dsess.final_score:.2f}"
+    )
+
+    for it in dsess.iterations:
+        iter_emoji = "✅" if it.eval_ok else "🔄"
+        score_bar_pct = int(it.eval_score * 100)
+
+        st.markdown(f"---\n### {iter_emoji} Iteración {it.iteration} de {dsess.total_iterations}")
+        # Score progress bar
+        st.progress(min(it.eval_score, 1.0), text=f"Score: {it.eval_score:.2f}  ·  Temp: {it.writer_temperature:.2f}")
+
+        # ── MODELO ESCRITOR ──────────────────────────────────
+        st.markdown("#### ✍️ Modelo Escritor")
+
+        if it.iteration == 1:
+            st.caption("📌 Primera iteración — sin correcciones previas")
+        else:
+            st.caption(f"📌 Iteración {it.iteration} — con correcciones del evaluador")
+
+        # Lo que le llega al escritor (prompt)
+        with st.expander("📥 Prompt que recibe el Modelo Escritor", expanded=False):
+            st.markdown("**System prompt:**")
+            st.text_area(
+                "system_writer", it.writer_prompt_system,
+                height=200, disabled=True, label_visibility="collapsed",
+                key=f"dbg_writer_sys_{it.iteration}"
+            )
+            label_user = "User prompt (pregunta original)" if it.iteration == 1 else "User prompt (con feedback / correcciones)"
+            st.markdown(f"**{label_user}:**")
+            st.text_area(
+                "user_writer", it.writer_prompt_user,
+                height=150, disabled=True, label_visibility="collapsed",
+                key=f"dbg_writer_usr_{it.iteration}"
+            )
+
+        # Lo que responde el escritor
+        st.markdown("**📤 Respuesta del Modelo Escritor:**")
+        st.info(it.writer_response)
+
+        # ── MODELO EVALUADOR ─────────────────────────────────
+        st.markdown("#### 🔍 Modelo Evaluador")
+
+        # Lo que le llega al evaluador (prompt)
+        with st.expander("📥 Prompt que recibe el Modelo Evaluador", expanded=False):
+            st.text_area(
+                "eval_prompt", it.evaluator_prompt,
+                height=250, disabled=True, label_visibility="collapsed",
+                key=f"dbg_eval_prompt_{it.iteration}"
+            )
+
+        # Lo que responde el evaluador
+        st.markdown("**📤 Respuesta del Modelo Evaluador:**")
+        # Parsear la respuesta del evaluador para mostrarla de forma legible
+        try:
+            eval_parsed = json.loads(it.evaluator_raw_response)
+            eval_cols = st.columns([1, 1, 1])
+            with eval_cols[0]:
+                s = eval_parsed.get("score", 0)
+                st.metric("Score", f"{s:.2f}", delta=None)
+            with eval_cols[1]:
+                datos_ok = eval_parsed.get("datos_correctos", None)
+                st.metric("Datos correctos", "✅ Sí" if datos_ok else "❌ No")
+            with eval_cols[2]:
+                narrativa = eval_parsed.get("narrativa_quality", "?")
+                emoji_narr = {"alta": "🟢", "media": "🟡", "baja": "🔴"}.get(narrativa, "⚪")
+                st.metric("Narrativa", f"{emoji_narr} {narrativa}")
+
+            # Análisis holístico
+            reason = eval_parsed.get("reason", "")
+            if reason:
+                st.info(f"💬 **Análisis:** {reason}")
+
+            # Mejoras sugeridas
+            mejoras = eval_parsed.get("mejoras", [])
+            if mejoras:
+                st.markdown("**📋 Mejoras prioritarias:**")
+                for j, mejora in enumerate(mejoras, 1):
+                    st.markdown(f"{j}. {mejora}")
+            else:
+                st.success("Sin mejoras sugeridas — informe excelente")
+
+        except (json.JSONDecodeError, TypeError):
+            # Fallback: mostrar raw si no se puede parsear
+            st.code(it.evaluator_raw_response, language="json")
+            if it.eval_reason:
+                st.caption(f"💬 {it.eval_reason}")
+
+    # Footer
+    st.markdown("---")
+    final_emoji = "✅" if dsess.final_score >= market_config.min_eval_score else "⚠️"
+    st.markdown(
+        f"### {final_emoji} Resultado final: score **{dsess.final_score:.2f}** "
+        f"en **{dsess.total_iterations}** iteración(es)"
+    )
+
+# Botón para agregar al dataset (fuera del bloque de generación, usa session_state)
+if "last_eval_result" in st.session_state and st.session_state["last_eval_result"]:
+    eval_data = st.session_state["last_eval_result"]
+    if eval_data.get("score", 0) >= market_config.min_eval_score:
+        if st.sidebar.button("➕ Agregar ejemplo al dataset"):
             try:
-                rec = {"prompt": format_variations_for_prompt(df_use) + " Noticias: " + (news_text or " "), "response": answer}
+                df_use_saved = eval_data["df_use"]
+                news_text_saved = eval_data.get("news_text", "")
+                answer_saved = eval_data["answer"]
+                score_saved = eval_data["score"]
+                rec = {
+                    "prompt": format_variations_for_prompt(df_use_saved) + "\n\nNoticias:\n" + (news_text_saved or ""),
+                    "response": answer_saved,
+                    "accuracy": score_saved
+                }
                 with open(THRESHOLD_PATH, "a", encoding="utf-8") as fh:
                     fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                st.sidebar.success("Ejemplo agregado.")
+                st.sidebar.success("✅ Ejemplo agregado al dataset.")
+                # Limpiar para no agregar duplicados
+                st.session_state["last_eval_result"] = None
             except Exception as e:
-                st.sidebar.error(f"Error guardando dataset: {e}")
+                st.sidebar.error(f"Error guardando: {e}")
 
     # save history
     try:

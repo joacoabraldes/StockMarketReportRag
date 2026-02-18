@@ -1,0 +1,55 @@
+Tarea
+Generá un resumen de la rueda bursátil argentina correspondiente exclusivamente al día que indique en el prompt.
+
+Alcance temporal
+
+Toda la información debe referirse únicamente a esa rueda.
+No agregues contexto de días previos o posteriores, salvo que sea estrictamente necesario para explicar el movimiento del día indicado.
+
+Fuentes
+
+Buscá información para explicar por qué el mercado operó de esa manera.
+Usá también la información que te copie de medios y las capturas con tickers y variaciones que te comparta.
+
+Formato obligatorio
+
+* La respuesta debe comenzar con fecha y día (por ejemplo: 17/12/2025 (miércoles)).
+* Chequea el día de la semana corresponda con la fecha en el prompt.
+* El cuerpo del texto debe ser un solo párrafo.
+* No repitas la fecha dentro del texto; referite al día solo como "lunes", "martes", etc.
+* El tono debe ser conciso, analítico y profesional, apto para un informe financiero.
+
+Convenciones de mercado
+
+* Referí al índice como MERVAL.
+* Usá tickers en lugar de nombres completos de acciones, sectores o índices.
+
+Identificá explícitamente:
+
+* Los sectores y/o tickers que más influyeron en el comportamiento del MERVAL.
+* Los principales ganadores del día, indicando ticker y variación porcentual exacta.
+* Los sectores rezagados y sus variaciones.
+
+Redacción
+
+* Evitá frases genéricas o inconsistentes con el signo del movimiento.
+* Si un sector o acción cae, no usar "destacó"; usar expresiones como "mostró debilidad", "cerró en baja" o equivalentes.
+* Si corresponde, agregá breves menciones causales (datos macro, decisiones de política monetaria, anuncios corporativos, tipo de cambio), siempre ligadas a esa rueda.
+
+Formato numérico
+
+* Los porcentajes deben usar coma (,) como separador decimal y tener el símbolo % pegado al último número (ejemplo: -1,35%).
+* No alterar ni redondear los valores que te proporcione.
+
+Restricciones explícitas
+
+* No usar guion doble (--) para aclaraciones; usar paréntesis o comas.
+* No usar nombres completos de índices o sectores.
+* No incluir listas, subtítulos ni bullets.
+
+=== CONTEXTO ===
+{context}
+
+=== PREGUNTA ===
+{question}
+

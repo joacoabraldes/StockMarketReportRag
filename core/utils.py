@@ -25,11 +25,6 @@ def clean_text(s: str) -> str:
     s = s.replace("#", "＃").replace("*", "＊").replace("_", "﹎")
     return s.strip()
 
-def clean_keep_ascii_marks(s: str) -> str:
-    s = unicodedata.normalize("NFKC", s or "")
-    s = s.replace("\u00A0", " ").replace("\u00AD", "").replace("\u200B", "")
-    return re.sub(r"[ \t]+", " ", s).strip()
-
 def fetch_url_text(url: str, timeout: int = 8) -> str:
     try:
         r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
@@ -40,24 +35,6 @@ def fetch_url_text(url: str, timeout: int = 8) -> str:
         return clean_text(txt)[:20000]
     except Exception:
         return ""
-
-def chunk_text(text: str, max_chars: int = 1200) -> List[str]:
-    text = (text or "").strip()
-    if not text:
-        return []
-    chunks = []
-    i = 0
-    while i < len(text):
-        end = min(len(text), i + max_chars)
-        sub = text[i:end]
-        last_dot = sub.rfind(". ")
-        if last_dot > int(max_chars*0.5):
-            cut = i + last_dot + 1
-        else:
-            cut = end
-        chunks.append(text[i:cut].strip())
-        i = cut
-    return chunks
 
 def extract_date_from_text(text: str) -> Optional[str]:
     if not text:
