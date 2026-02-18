@@ -392,6 +392,9 @@ if user_input:
     # call LLM (OpenAI) to generate answer - with retry if score < threshold
     MAX_RETRIES = market_config.max_eval_retries
     MIN_SCORE = market_config.min_eval_score
+    PLATEAU_THRESHOLD = 0.02   # si el score mejora menos que esto 2 veces seguidas → plateau
+    GOOD_ENOUGH_AFTER = 3      # después de N intentos, aceptar si score >= GOOD_ENOUGH_SCORE
+    GOOD_ENOUGH_SCORE = 0.88   # umbral secundario para cortar si no alcanza el ideal
     best_answer = None
     best_score = 0.0
     best_eval_res = None
@@ -415,6 +418,8 @@ if user_input:
 
             accumulated_feedback: list[dict] = []  # Historial de correcciones estructuradas
             eval_history: list[dict] = []  # Historial completo para el evaluador
+            consecutive_plateau = 0  # cuántas veces seguidas la mejora fue < PLATEAU_THRESHOLD
+            prev_score = 0.0
 
             for attempt in range(MAX_RETRIES):
                 try:
@@ -426,41 +431,44 @@ if user_input:
                         send_messages = llm_messages.copy()
                     else:
                         # Construir bloque de feedback holístico del evaluador
-                        feedback_parts = []
-                        for i, fb in enumerate(accumulated_feedback):
-                            part = f"--- Intento {i+1} (score {fb['score']:.2f}) ---"
-                            if fb.get('reason'):
-                                part += f"\nAnálisis del evaluador: {fb['reason']}"
-                            if fb.get('datos_correctos') is False:
-                                part += "\n⚠️ HAY VALORES NUMÉRICOS INCORRECTOS. Verificá cada dato contra el CSV."
-                            if fb.get('narrativa_quality'):
-                                part += f"\nCalidad narrativa: {fb['narrativa_quality']}"
-                            if fb.get('mejoras'):
-                                part += "\nMEJORAS PRIORITARIAS:"
-                                for mejora in fb['mejoras']:
-                                    part += f"\n  • {mejora}"
-                            feedback_parts.append(part)
+                        # Tomar SOLO el último feedback (el más reciente y relevante)
+                        last_fb = accumulated_feedback[-1]
+                        feedback_block = f"Score: {last_fb['score']:.2f}\n"
+                        if last_fb.get('reason'):
+                            feedback_block += f"Análisis: {last_fb['reason']}\n"
+                        if last_fb.get('datos_correctos') is False:
+                            feedback_block += "⚠️ HAY VALORES NUMÉRICOS INCORRECTOS. Verificá cada dato contra el CSV.\n"
+                        if last_fb.get('narrativa_quality'):
+                            feedback_block += f"Calidad narrativa: {last_fb['narrativa_quality']}\n"
+                        if last_fb.get('mejoras'):
+                            feedback_block += "MEJORAS PRIORITARIAS:\n"
+                            for mejora in last_fb['mejoras']:
+                                feedback_block += f"  • {mejora}\n"
 
-                        feedback_block = "\n\n".join(feedback_parts)
-
+                        # En vez de reescribir de cero, darle SU MEJOR respuesta anterior
+                        # y pedirle que la EDITE aplicando las mejoras
                         retry_user_msg = f"""{question_for_prompt}
-
-ATENCIÓN: Este es el intento {attempt + 1}. El evaluador encontró aspectos a mejorar.
 
 === DATOS CSV DE REFERENCIA (verificá tus valores contra estos) ===
 {csv_data_for_eval}
 
-=== FEEDBACK DEL EVALUADOR (intentos anteriores) ===
+=== TU RESPUESTA ANTERIOR (intento {attempt}, score {best_score:.2f}) ===
+{best_answer}
+
+=== FEEDBACK DEL EVALUADOR ===
 {feedback_block}
 
-=== INSTRUCCIONES ===
-1. Leé el feedback del evaluador y aplicá las mejoras prioritarias.
-2. Verificá que los valores numéricos que mencionés coincidan con el CSV.
-3. Priorizá la narrativa: explicá POR QUÉ se movió el mercado, no solo listés tickers.
-4. Integrá noticias y datos macro como causas de los movimientos.
-5. Mantené estructura profesional (párrafos fluidos, no bullet points).
+=== INSTRUCCIONES DE MEJORA ===
+Tomá tu respuesta anterior como base y EDITALA aplicando las mejoras pedidas.
+NO reescribas desde cero: mejorá lo que ya tenés sin perder lo que estaba bien.
 
-Generá la respuesta mejorada ahora:"""
+1. Aplicá las mejoras prioritarias listadas arriba.
+2. Verificá que TODOS los valores numéricos coincidan exactamente con el CSV.
+3. Mejorá la narrativa: explicá POR QUÉ se movió el mercado, conectando causas y efectos.
+4. Integrá noticias y datos macro como causas de los movimientos.
+5. No pierdas información correcta que ya tenías en la versión anterior.
+
+Generá la respuesta mejorada:"""
                         send_messages = [
                             {"role": "system", "content": system_prompt},
                             {"role": "user", "content": retry_user_msg},
@@ -508,6 +516,23 @@ Generá la respuesta mejorada ahora:"""
                         
                         # Si alcanzamos el umbral, salir
                         if score >= MIN_SCORE:
+                            break
+                        
+                        # ── Detección de plateau ──
+                        # Si el score dejó de mejorar significativamente, no gastar más intentos
+                        improvement = score - prev_score if attempt > 0 else score
+                        prev_score = score
+                        
+                        if attempt > 0 and improvement < PLATEAU_THRESHOLD:
+                            consecutive_plateau += 1
+                        else:
+                            consecutive_plateau = 0
+                        
+                        # Cortar si: plateau 2 veces seguidas Y score "bueno suficiente",
+                        # O si ya pasamos GOOD_ENOUGH_AFTER intentos con score decente
+                        if consecutive_plateau >= 2 and best_score >= GOOD_ENOUGH_SCORE:
+                            break
+                        if attempt + 1 >= GOOD_ENOUGH_AFTER and best_score >= GOOD_ENOUGH_SCORE:
                             break
                         
                         # Acumular feedback holístico para el próximo intento

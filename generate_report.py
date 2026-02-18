@@ -129,10 +129,16 @@ def run_generation(
         {"role": "user", "content": user_message},
     ]
 
+    PLATEAU_THRESHOLD = 0.02
+    GOOD_ENOUGH_AFTER = 3
+    GOOD_ENOUGH_SCORE = 0.88
+
     best_answer = ""
     best_score = 0.0
     accumulated_feedback: list[dict] = []
     eval_history: list[dict] = []
+    consecutive_plateau = 0
+    prev_score = 0.0
 
     for attempt in range(config.max_eval_retries):
         # Temperatura: subir muy poco (+0.03/intento, max +0.12)
@@ -142,42 +148,42 @@ def run_generation(
         if attempt == 0:
             send_messages = base_messages.copy()
         else:
-            # Construir bloque de feedback holístico del evaluador
-            feedback_parts = []
-            for i, fb in enumerate(accumulated_feedback):
-                part = f"--- Intento {i+1} (score {fb['score']:.2f}) ---"
-                if fb.get('reason'):
-                    part += f"\nAnálisis del evaluador: {fb['reason']}"
-                if fb.get('datos_correctos') is False:
-                    part += "\n⚠️ HAY VALORES NUMÉRICOS INCORRECTOS. Verificá cada dato contra el CSV."
-                if fb.get('narrativa_quality'):
-                    part += f"\nCalidad narrativa: {fb['narrativa_quality']}"
-                if fb.get('mejoras'):
-                    part += "\nMEJORAS PRIORITARIAS:"
-                    for mejora in fb['mejoras']:
-                        part += f"\n  • {mejora}"
-                feedback_parts.append(part)
-
-            feedback_block = "\n\n".join(feedback_parts)
+            # Tomar SOLO el último feedback (el más reciente y relevante)
+            last_fb = accumulated_feedback[-1]
+            feedback_block = f"Score: {last_fb['score']:.2f}\n"
+            if last_fb.get('reason'):
+                feedback_block += f"Análisis: {last_fb['reason']}\n"
+            if last_fb.get('datos_correctos') is False:
+                feedback_block += "⚠️ HAY VALORES NUMÉRICOS INCORRECTOS. Verificá cada dato contra el CSV.\n"
+            if last_fb.get('narrativa_quality'):
+                feedback_block += f"Calidad narrativa: {last_fb['narrativa_quality']}\n"
+            if last_fb.get('mejoras'):
+                feedback_block += "MEJORAS PRIORITARIAS:\n"
+                for mejora in last_fb['mejoras']:
+                    feedback_block += f"  • {mejora}\n"
 
             retry_user_msg = f"""{user_message}
-
-ATENCIÓN: Este es el intento {attempt + 1}. El evaluador encontró aspectos a mejorar.
 
 === DATOS CSV DE REFERENCIA (verificá tus valores contra estos) ===
 {csv_for_eval}
 
-=== FEEDBACK DEL EVALUADOR (intentos anteriores) ===
+=== TU RESPUESTA ANTERIOR (intento {attempt}, score {best_score:.2f}) ===
+{best_answer}
+
+=== FEEDBACK DEL EVALUADOR ===
 {feedback_block}
 
-=== INSTRUCCIONES ===
-1. Leé el feedback del evaluador y aplicá las mejoras prioritarias.
-2. Verificá que los valores numéricos que mencionés coincidan con el CSV.
-3. Priorizá la narrativa: explicá POR QUÉ se movió el mercado, no solo listés tickers.
-4. Integrá noticias y datos macro como causas de los movimientos.
-5. Mantené estructura profesional (párrafos fluidos, no bullet points).
+=== INSTRUCCIONES DE MEJORA ===
+Tomá tu respuesta anterior como base y EDITALA aplicando las mejoras pedidas.
+NO reescribas desde cero: mejorá lo que ya tenés sin perder lo que estaba bien.
 
-Generá la respuesta mejorada ahora:"""
+1. Aplicá las mejoras prioritarias listadas arriba.
+2. Verificá que TODOS los valores numéricos coincidan exactamente con el CSV.
+3. Mejorá la narrativa: explicá POR QUÉ se movió el mercado, conectando causas y efectos.
+4. Integrá noticias y datos macro como causas de los movimientos.
+5. No pierdas información correcta que ya tenías en la versión anterior.
+
+Generá la respuesta mejorada:"""
             send_messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": retry_user_msg},
@@ -225,6 +231,22 @@ Generá la respuesta mejorada ahora:"""
         if score >= config.min_eval_score:
             break
 
+        # ── Detección de plateau ──
+        improvement = score - prev_score if attempt > 0 else score
+        prev_score = score
+
+        if attempt > 0 and improvement < PLATEAU_THRESHOLD:
+            consecutive_plateau += 1
+        else:
+            consecutive_plateau = 0
+
+        if consecutive_plateau >= 2 and best_score >= GOOD_ENOUGH_SCORE:
+            print(f"  ⏹️  Plateau detected (score stable at ~{best_score:.2f}). Accepting best result.")
+            break
+        if attempt + 1 >= GOOD_ENOUGH_AFTER and best_score >= GOOD_ENOUGH_SCORE:
+            print(f"  ⏹️  Good enough after {attempt + 1} attempts (score={best_score:.2f}). Accepting.")
+            break
+
         # Acumular feedback estructurado para el próximo intento
         if attempt < config.max_eval_retries - 1:
             accumulated_feedback.append({
@@ -233,7 +255,8 @@ Generá la respuesta mejorada ahora:"""
                 "datos_correctos": eval_res.get("datos_correctos", True),
                 "narrativa_quality": eval_res.get("narrativa_quality", ""),
                 "mejoras": eval_res.get("mejoras", []),
-            })            eval_history.append({
+            })
+            eval_history.append({
                 "iteration": attempt + 1,
                 "response": answer,
                 "score": score,

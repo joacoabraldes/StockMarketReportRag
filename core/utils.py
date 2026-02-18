@@ -64,9 +64,11 @@ def format_variations_for_prompt(df: "pd.DataFrame", source_name: str = "variaci
     Convierte todo el DataFrame en UN SOLO string (una única fuente).
     - Mantiene la precisión numérica (no redondea).
     - Convierte Var_diaria_% a formato humano con coma decimal y '%' si existe.
-    - Devuelve: "Fuente:<source_name> Tickers:\n<fila1>\n<fila2>\n..."
-      (cada fila en una línea, pero TODO forma parte de la misma fuente/documento).
+    - Usa '|' como separador de campos para evitar ambigüedad con la coma decimal.
+    - Devuelve: "Fuente:<source_name> Tickers:\nheader\nfila1\nfila2\n..."
     """
+    SEP = " | "
+
     def fmt_pct(v):
         if v is None:
             return ""
@@ -81,6 +83,8 @@ def format_variations_for_prompt(df: "pd.DataFrame", source_name: str = "variaci
         return s + "%"
 
     rows = []
+    # Header para que el LLM entienda cada columna
+    rows.append(f"Ticker{SEP}YahooSymbol{SEP}Close_last{SEP}Close_prev{SEP}Var_diaria_%{SEP}Fecha_last")
     for _, r in df.iterrows():
         ticker = r.get("Ticker", "") or ""
         sym = r.get("YahooSymbol", "") or ""
@@ -97,7 +101,7 @@ def format_variations_for_prompt(df: "pd.DataFrame", source_name: str = "variaci
         date = r.get("Fecha_last", "")
         date_str = "" if (date is None or (isinstance(date, float) and pd.isna(date))) else f"{date}"
 
-        rows.append(f"{ticker},{sym},{cl_str},{prev_str},{pct_str},{date_str}")
+        rows.append(f"{ticker}{SEP}{sym}{SEP}{cl_str}{SEP}{prev_str}{SEP}{pct_str}{SEP}{date_str}")
 
     # Una única fuente para todo el CSV
     body = "\n".join(rows)
