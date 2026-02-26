@@ -271,7 +271,11 @@ def run_generation(
             send_messages = base_messages.copy()
         else:
             last_fb = accumulated_feedback[-1]
-            feedback_block = f"Score: {last_fb['score']:.2f}\n"
+            # Usar la respuesta correspondiente al feedback (no necesariamente best_answer)
+            # para mantener coherencia entre la respuesta y su evaluación
+            fb_answer = last_fb.get("answer", best_answer)
+            fb_score = last_fb["score"]
+            feedback_block = f"Score: {fb_score:.2f}\n"
             if last_fb.get("reason"):
                 feedback_block += f"Análisis: {last_fb['reason']}\n"
             if last_fb.get("datos_correctos") is False:
@@ -288,10 +292,13 @@ def run_generation(
 === DATOS CSV DE REFERENCIA (verificá tus valores contra estos) ===
 {csv_for_eval}
 
-=== TU RESPUESTA ANTERIOR (intento {attempt}, score {best_score:.2f}) ===
+=== TU MEJOR RESPUESTA HASTA AHORA (score {best_score:.2f}) ===
 {best_answer}
 
-=== FEEDBACK DEL EVALUADOR ===
+=== TU ÚLTIMO INTENTO (intento {attempt}, score {fb_score:.2f}) ===
+{fb_answer}
+
+=== FEEDBACK DEL EVALUADOR (sobre el último intento) ===
 {feedback_block}
 
 === INSTRUCCIONES DE MEJORA ===
@@ -310,10 +317,11 @@ Generá la respuesta mejorada:"""
                 {"role": "user", "content": retry_user_msg},
             ]
 
+        effective_temp = min(retry_temp, 1.0)
         resp = client.chat.completions.create(
             model=config.openai_model,
             messages=send_messages,
-            temperature=min(retry_temp, 1.0),
+            temperature=effective_temp,
         )
         answer = resp.choices[0].message.content
 
@@ -336,7 +344,7 @@ Generá la respuesta mejorada:"""
             writer_system=system_prompt,
             writer_user=writer_user,
             writer_response=answer,
-            writer_temperature=retry_temp,
+            writer_temperature=effective_temp,
             evaluator_prompt=eval_prompt,
             evaluator_raw=eval_raw,
             eval_score=score,
@@ -354,24 +362,12 @@ Generá la respuesta mejorada:"""
         if score >= config.min_eval_score:
             break
 
-        # Plateau
-        improvement = score - prev_score if attempt > 0 else score
-        prev_score = score
-
-        if attempt > 0 and improvement < PLATEAU_THRESHOLD:
-            consecutive_plateau += 1
-        else:
-            consecutive_plateau = 0
-
-        if consecutive_plateau >= 2 and best_score >= GOOD_ENOUGH_SCORE:
-            print(f"  ⏹️  Plateau detectado (score estable en ~{best_score:.2f}). Aceptando mejor resultado.")
-            break
-        if attempt + 1 >= GOOD_ENOUGH_AFTER and best_score >= GOOD_ENOUGH_SCORE:
-            print(f"  ⏹️  Suficientemente bueno tras {attempt + 1} intentos (score={best_score:.2f}). Aceptando.")
-            break
-
+        # Acumular feedback ANTES de las decisiones de plateau
+        # para que el próximo intento siempre tenga el feedback de este intento.
         if attempt < config.max_eval_retries - 1:
             accumulated_feedback.append({
+                "attempt": attempt + 1,
+                "answer": answer,
                 "score": score,
                 "reason": reason,
                 "datos_correctos": eval_res.get("datos_correctos", True),
@@ -385,6 +381,22 @@ Generá la respuesta mejorada:"""
                 "reason": reason,
                 "mejoras": eval_res.get("mejoras", []),
             })
+
+        # Plateau — solo cuenta si el score se estanca (no si baja)
+        improvement = score - prev_score if attempt > 0 else score
+        prev_score = score
+
+        if attempt > 0 and abs(improvement) < PLATEAU_THRESHOLD:
+            consecutive_plateau += 1
+        else:
+            consecutive_plateau = 0
+
+        if consecutive_plateau >= 2 and best_score >= GOOD_ENOUGH_SCORE:
+            print(f"  ⏹️  Plateau detectado (score estable en ~{best_score:.2f}). Aceptando mejor resultado.")
+            break
+        if attempt + 1 >= GOOD_ENOUGH_AFTER and best_score >= GOOD_ENOUGH_SCORE:
+            print(f"  ⏹️  Suficientemente bueno tras {attempt + 1} intentos (score={best_score:.2f}). Aceptando.")
+            break
 
     debug.finish(final_answer=best_answer, final_score=best_score)
     return best_answer, best_score, debug

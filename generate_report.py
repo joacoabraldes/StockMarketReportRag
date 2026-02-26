@@ -74,6 +74,7 @@ def run_generation(
     news_text: str = "",
     news_urls: Optional[List[str]] = None,
     temperature: float = 0.0,
+    user_prompt: Optional[str] = None,
 ) -> tuple[str, float, DebugSession]:
     """
     End-to-end report generation with evaluation loop.
@@ -104,7 +105,8 @@ def run_generation(
 
     # ── 2. Build prompt ───────────────────────────────────────────
     csv_block = format_variations_for_prompt(df_out)
-    question = f"Generá resumen para {qdate}"
+    default_question = f"Generá resumen para {qdate}"
+    question = user_prompt if user_prompt else default_question
     system_prompt = build_system_prompt(config, csv_block, question, news_text, news_urls)
     user_message = question
 
@@ -162,7 +164,10 @@ def run_generation(
         else:
             # Tomar SOLO el último feedback (el más reciente y relevante)
             last_fb = accumulated_feedback[-1]
-            feedback_block = f"Score: {last_fb['score']:.2f}\n"
+            # Usar la respuesta correspondiente al feedback (no necesariamente best_answer)
+            fb_answer = last_fb.get("answer", best_answer)
+            fb_score = last_fb["score"]
+            feedback_block = f"Score: {fb_score:.2f}\n"
             if last_fb.get('reason'):
                 feedback_block += f"Análisis: {last_fb['reason']}\n"
             if last_fb.get('datos_correctos') is False:
@@ -179,10 +184,13 @@ def run_generation(
 === DATOS CSV DE REFERENCIA (verificá tus valores contra estos) ===
 {csv_for_eval}
 
-=== TU RESPUESTA ANTERIOR (intento {attempt}, score {best_score:.2f}) ===
+=== TU MEJOR RESPUESTA HASTA AHORA (score {best_score:.2f}) ===
 {best_answer}
 
-=== FEEDBACK DEL EVALUADOR ===
+=== TU ÚLTIMO INTENTO (intento {attempt}, score {fb_score:.2f}) ===
+{fb_answer}
+
+=== FEEDBACK DEL EVALUADOR (sobre el último intento) ===
 {feedback_block}
 
 === INSTRUCCIONES DE MEJORA ===
@@ -201,10 +209,11 @@ Generá la respuesta mejorada:"""
                 {"role": "user", "content": retry_user_msg},
             ]
 
+        effective_temp = min(retry_temp, 1.0)
         resp = client.chat.completions.create(
             model=config.openai_model,
             messages=send_messages,
-            temperature=min(retry_temp, 1.0),
+            temperature=effective_temp,
         )
         answer = resp.choices[0].message.content
 
@@ -226,7 +235,7 @@ Generá la respuesta mejorada:"""
             writer_system=system_prompt,
             writer_user=writer_user,
             writer_response=answer,
-            writer_temperature=retry_temp,
+            writer_temperature=effective_temp,
             evaluator_prompt=eval_prompt,
             evaluator_raw=eval_raw,
             eval_score=score,
@@ -244,25 +253,11 @@ Generá la respuesta mejorada:"""
         if score >= config.min_eval_score:
             break
 
-        # ── Detección de plateau ──
-        improvement = score - prev_score if attempt > 0 else score
-        prev_score = score
-
-        if attempt > 0 and improvement < PLATEAU_THRESHOLD:
-            consecutive_plateau += 1
-        else:
-            consecutive_plateau = 0
-
-        if consecutive_plateau >= 2 and best_score >= GOOD_ENOUGH_SCORE:
-            print(f"  ⏹️  Plateau detected (score stable at ~{best_score:.2f}). Accepting best result.")
-            break
-        if attempt + 1 >= GOOD_ENOUGH_AFTER and best_score >= GOOD_ENOUGH_SCORE:
-            print(f"  ⏹️  Good enough after {attempt + 1} attempts (score={best_score:.2f}). Accepting.")
-            break
-
-        # Acumular feedback estructurado para el próximo intento
+        # Acumular feedback ANTES de las decisiones de plateau
         if attempt < config.max_eval_retries - 1:
             accumulated_feedback.append({
+                "attempt": attempt + 1,
+                "answer": answer,
                 "score": score,
                 "reason": reason,
                 "datos_correctos": eval_res.get("datos_correctos", True),
@@ -276,6 +271,22 @@ Generá la respuesta mejorada:"""
                 "reason": reason,
                 "mejoras": eval_res.get("mejoras", []),
             })
+
+        # ── Detección de plateau — solo cuenta si el score se estanca (no si baja) ──
+        improvement = score - prev_score if attempt > 0 else score
+        prev_score = score
+
+        if attempt > 0 and abs(improvement) < PLATEAU_THRESHOLD:
+            consecutive_plateau += 1
+        else:
+            consecutive_plateau = 0
+
+        if consecutive_plateau >= 2 and best_score >= GOOD_ENOUGH_SCORE:
+            print(f"  ⏹️  Plateau detected (score stable at ~{best_score:.2f}). Accepting best result.")
+            break
+        if attempt + 1 >= GOOD_ENOUGH_AFTER and best_score >= GOOD_ENOUGH_SCORE:
+            print(f"  ⏹️  Good enough after {attempt + 1} attempts (score={best_score:.2f}). Accepting.")
+            break
     debug.finish(final_answer=best_answer, final_score=best_score)
     return best_answer, best_score, debug
 
@@ -287,11 +298,22 @@ def main():
     parser.add_argument("--out", default=None, help="Output .txt path (default: informe_<market>_<date>.txt)")
     parser.add_argument("--news", default="", help="Inline news text")
     parser.add_argument("--news-urls", nargs="*", default=[], help="News URLs (space-separated)")
+    parser.add_argument("-p", "--prompt", default=None, help="Path to .txt file with custom user prompt")
     parser.add_argument("--temperature", type=float, default=0.0, help="LLM temperature")
     args = parser.parse_args()
 
     config = get_market_config(args.market)
     print(f"🦜 PARROT — Generating {config.market_name} report for {args.date}")
+
+    # Load user prompt from file if provided
+    user_prompt_text = None
+    if args.prompt:
+        if not os.path.isfile(args.prompt):
+            print(f"ERROR: prompt file not found: {args.prompt}")
+            sys.exit(1)
+        with open(args.prompt, "r", encoding="utf-8") as fh:
+            user_prompt_text = fh.read().strip()
+        print(f"📝 User prompt loaded from {args.prompt}")
 
     answer, score, debug_session = run_generation(
         config=config,
@@ -299,6 +321,7 @@ def main():
         news_text=args.news,
         news_urls=args.news_urls or None,
         temperature=args.temperature,
+        user_prompt=user_prompt_text,
     )
 
     # Save report

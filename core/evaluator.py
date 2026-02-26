@@ -15,7 +15,7 @@ THRESHOLD_DATASET_PATH = "./data/threshold_dataset.jsonl"
 # ─── Decimal / format normalisation helpers ───────────────────────────
 
 _PCT_RE = re.compile(
-    r"[+\-−]?\s*\d{1,6}[.,]\d{1,4}\s*%"      # e.g. -0,84%  +1.31%  0,04%
+    r"[+\-−]?\d{1,6}[.,]\d{1,4}\s*%"      # e.g. -0,84%  +1.31%  0,04%
 )
 
 def normalize_decimal(text: str) -> str:
@@ -27,7 +27,7 @@ def normalize_decimal(text: str) -> str:
         s = m.group(0)
         s = s.replace(",", ".")          # comma → dot
         s = s.replace("−", "-")          # unicode minus → ascii minus
-        s = s.replace(" ", "")           # strip inner spaces
+        s = s.replace(" ", "")           # strip trailing space before %
         # strip leading '+' so +1.31% == 1.31%
         s = re.sub(r"^\+", "", s)
         # normalise to 2-decimal precision to avoid 1.3% vs 1.31% noise
@@ -66,8 +66,11 @@ def load_dataset(path: str = THRESHOLD_DATASET_PATH) -> List[Dict[str,str]]:
     return out
 
 def extract_date_from_prompt(prompt: str) -> Optional[str]:
-    """Extrae la fecha del prompt (formato YYYY-MM-DD al inicio)."""
-    match = re.match(r"(\d{4}-\d{2}-\d{2})", prompt.strip())
+    """Extrae la primera fecha YYYY-MM-DD que aparezca en el prompt.
+    Busca en todo el texto (no solo al inicio) para funcionar tanto con
+    prompts del dataset ('2026-02-20 datos...') como con CSV blocks
+    generados por format_variations_for_prompt ('Fuente:... 2026-02-20 ...')."""
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", prompt.strip())
     return match.group(1) if match else None
 
 def find_reference_for_date(dataset: List[Dict], target_date: str) -> Optional[Dict]:
