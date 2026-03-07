@@ -35,7 +35,7 @@ from core.evaluator import (
     find_reference_for_date,
     normalize_decimal,
 )
-from core.utils import format_variations_for_prompt, fetch_url_text
+from core.utils import format_variations_for_prompt, fetch_url_text, resolve_news_text
 from core.debug_logger import DebugSession
 
 DIAS_SEMANA = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -296,11 +296,16 @@ def main():
     parser.add_argument("--date", required=True, help="Target date YYYY-MM-DD")
     parser.add_argument("--market", default="US", help="Market ID: US, AR, …")
     parser.add_argument("--out", default=None, help="Output .txt path (default: informe_<market>_<date>.txt)")
-    parser.add_argument("--news", default="", help="Inline news text")
+    parser.add_argument("--news", default="", help="Inline news text or path to a .txt file with news")
     parser.add_argument("--news-urls", nargs="*", default=[], help="News URLs (space-separated)")
     parser.add_argument("-p", "--prompt", default=None, help="Path to .txt file with custom user prompt")
     parser.add_argument("--temperature", type=float, default=0.0, help="LLM temperature")
     args = parser.parse_args()
+
+    # Resolve --news: if it's a .txt file, read its content
+    news_text = resolve_news_text(args.news)
+    if news_text != args.news:
+        print(f"📰 News loaded from {args.news.strip()}")
 
     config = get_market_config(args.market)
     print(f"🦜 PARROT — Generating {config.market_name} report for {args.date}")
@@ -318,7 +323,7 @@ def main():
     answer, score, debug_session = run_generation(
         config=config,
         target_date=args.date,
-        news_text=args.news,
+        news_text=news_text,
         news_urls=args.news_urls or None,
         temperature=args.temperature,
         user_prompt=user_prompt_text,

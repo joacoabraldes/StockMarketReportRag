@@ -50,7 +50,7 @@ from core.evaluator import (
     extract_date_from_prompt,
     find_reference_for_date,
 )
-from core.utils import fetch_url_text, format_variations_for_prompt
+from core.utils import fetch_url_text, format_variations_for_prompt, resolve_news_text
 from core.compute_variations import compute_variations
 from core.debug_logger import DebugSession
 
@@ -436,7 +436,7 @@ Si hay Close_last y Close_prev pero falta Var_diaria_%%, se calcula automáticam
     )
     parser.add_argument(
         "--news", default="",
-        help="Texto inline de noticias (entre comillas).",
+        help="Texto inline de noticias o ruta a un archivo .txt con noticias.",
     )
     parser.add_argument(
         "--market", default="US",
@@ -520,12 +520,17 @@ Si hay Close_last y Close_prev pero falta Var_diaria_%%, se calcula automáticam
             user_prompt_text = fh.read().strip()
         print(f"📝 User prompt cargado desde {prompt_path}")
 
+    # Resolve --news: if it's a .txt file, read its content
+    news_text = resolve_news_text(args.news)
+    if news_text != args.news:
+        print(f"📰 Noticias cargadas desde {args.news.strip()}")
+
     # Generar informe
     answer, score, debug_session = run_generation(
         config=config,
         csv_block=csv_block,
         report_date=report_date,
-        news_text=args.news,
+        news_text=news_text,
         news_urls=args.urls or None,
         temperature=args.temperature,
         user_prompt=user_prompt_text,

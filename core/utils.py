@@ -36,6 +36,16 @@ def fetch_url_text(url: str, timeout: int = 8) -> str:
     except Exception:
         return ""
 
+def resolve_news_text(value: str) -> str:
+    """Resolve --news argument: if it's a path to an existing .txt file, read it; otherwise return as-is."""
+    if not value or not value.strip():
+        return value
+    stripped = value.strip()
+    if stripped.endswith(".txt") and os.path.isfile(stripped):
+        with open(stripped, "r", encoding="utf-8") as fh:
+            return fh.read().strip()
+    return value
+
 def extract_date_from_text(text: str) -> Optional[str]:
     if not text:
         return None
